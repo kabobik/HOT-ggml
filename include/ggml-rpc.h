@@ -8,10 +8,13 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    8
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+// HOT-Step: GGML_OP_COUNT is 106 here (four fork-only ops), so this build is
+// not wire-compatible with a stock 8.0.x RPC peer. The patch version marks it,
+// set well above any stock patch level so a stock bump does not reach it.
+#define RPC_PROTO_PATCH_VERSION    101
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
