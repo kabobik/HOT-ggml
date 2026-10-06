@@ -302,6 +302,20 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_rows(tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            {
+                // HOT-Step: FLASH_ATTN_TRAIN_BACK's precomputed delta[]
+                // scratch region -- see ggml_metal_op_flash_attn_train_back_extra_delta's
+                // own comment in ggml-metal-ops.h.
+                res += ggml_metal_op_flash_attn_train_back_extra_delta(tensor);
+            } break;
+        case GGML_OP_CONVROT8:
+            {
+                // HOT-Step: scratch for the tiled CONVROT8 path (row scales +
+                // int8 codes), see ggml_metal_op_convrot8_extra. Reserved
+                // unconditionally so the env switch never changes allocation.
+                res += ggml_metal_op_convrot8_extra(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {
