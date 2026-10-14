@@ -4169,9 +4169,11 @@ static void ggml_cuda_plan_deferred_rounds(const ggml_cgraph * cgraph, std::vect
     }
     for (int k = 0; k < cgraph->n_nodes; ++k) {
         const ggml_tensor * n = cgraph->nodes[k];
+        // With BF16 activation storage the reader's other input may be BF16.
+        auto f32_or_bf16 = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16; };
         if (!(n->op == GGML_OP_ADD || n->op == GGML_OP_SUB || n->op == GGML_OP_MUL) ||
             !(n->flags & GGML_TENSOR_FLAG_COMPUTE) || n->type != GGML_TYPE_F32 ||
-            n->src[0]->type != GGML_TYPE_F32 || n->src[1]->type != GGML_TYPE_F32) {
+            !f32_or_bf16(n->src[0]) || !f32_or_bf16(n->src[1])) {
             continue;
         }
         for (int s = 0; s < 2; ++s) {
@@ -4184,6 +4186,81 @@ static void ggml_cuda_plan_deferred_rounds(const ggml_cgraph * cgraph, std::vect
     }
 }
 
+// BF16 activation storage (a training graph that keeps BF16-rounded values as
+// BF16 tensors): an elementwise or norm node that reads a BF16 source, or a
+// BF16_ROUND that stores one. The fusion kernels below assume F32 sources, so
+// try_fuse leaves a window around such nodes alone. Weight casts (CPY/CONT),
+// BF16 GEMM/OUT_PROD operands and BF16 attention inputs are not activations
+// here, so graphs without BF16 storage fuse exactly as before.
+static bool ggml_cuda_is_bf16_activation(const ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+        case GGML_OP_CPY: case GGML_OP_CONT: case GGML_OP_DUP: case GGML_OP_GET_ROWS: case GGML_OP_SET_ROWS:
+        case GGML_OP_MUL_MAT: case GGML_OP_MUL_MAT_ID: case GGML_OP_OUT_PROD:
+        case GGML_OP_FLASH_ATTN_TRAIN: case GGML_OP_FLASH_ATTN_TRAIN_BACK:
+            return false;
+        default:
+            break;
+    }
+    if (t->type == GGML_TYPE_BF16) {
+        return true;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (t->src[j] && t->src[j]->type == GGML_TYPE_BF16) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_bf16_activation_near(const ggml_cgraph * cgraph, int i) {
+    const int end = std::min(cgraph->n_nodes, i + 32);
+    for (int j = i; j < end; ++j) {
+        if (ggml_cuda_is_bf16_activation(cgraph->nodes[j])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// BF16 activation storage: an ADD/SUB/MUL whose only reader is the next
+// node's F32 -> BF16 ggml_bf16_round() store writes that BF16 result itself.
+// Same F32 value, same round-to-nearest-even cast; the F32 intermediate is
+// never written. The output may overlap an input only exactly, over a BF16
+// input of the same layout. GGML_CUDA_NO_BF16_STORE_FUSION=1 turns this off.
+static ggml_tensor * ggml_cuda_bf16_store_fusion_target(ggml_cgraph * cgraph, int i) {
+    static const bool disable = getenv("GGML_CUDA_NO_BF16_STORE_FUSION") != nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (disable || !(node->op == GGML_OP_ADD || node->op == GGML_OP_SUB || node->op == GGML_OP_MUL) ||
+        node->type != GGML_TYPE_F32 || i + 1 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+    ggml_tensor * rnd = cgraph->nodes[i + 1];
+    if (rnd->op != GGML_OP_UNARY || ggml_get_unary_op(rnd) != GGML_UNARY_OP_BF16_ROUND || rnd->src[0] != node ||
+        rnd->type != GGML_TYPE_BF16 || rnd->view_src || !ggml_are_same_shape(node, rnd) ||
+        !ggml_is_contiguous(node) || !ggml_is_contiguous(rnd)) {
+        return nullptr;
+    }
+    const ggml_op ops[2] = { node->op, GGML_OP_UNARY };
+    if (!ggml_can_fuse(cgraph, i, ops, 2)) {
+        return nullptr;
+    }
+    const char * d = (const char *) rnd->data;
+    for (int s = 0; s < 2; ++s) {
+        const ggml_tensor * src = node->src[s];
+        const char * a = (const char *) src->data;
+        // In place over a BF16 input of the same layout is safe: each thread
+        // reads and writes only its own element.
+        if (a == d && ggml_are_same_layout(src, rnd)) {
+            continue;
+        }
+        if (!(a + ggml_nbytes(src) <= d || d + ggml_nbytes(rnd) <= a)) {
+            return nullptr;
+        }
+    }
+    return rnd;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4192,6 +4269,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (ggml_tensor * rnd = ggml_cuda_bf16_store_fusion_target(cgraph, i)) {
+        ggml_tensor fused = *node;
+        fused.type   = rnd->type;
+        fused.data   = rnd->data;
+        fused.buffer = rnd->buffer;
+        for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+            fused.nb[k] = rnd->nb[k];
+        }
+        switch (node->op) {
+            case GGML_OP_ADD: ggml_cuda_op_add(*cuda_ctx, &fused); break;
+            case GGML_OP_SUB: ggml_cuda_op_sub(*cuda_ctx, &fused); break;
+            default:          ggml_cuda_op_mul(*cuda_ctx, &fused); break;
+        }
+        return 1;
+    }
+
+    if (ggml_cuda_bf16_activation_near(cgraph, i)) {
+        return 0;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5168,8 +5265,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;  // its reader rounds on load
                     }
                     ggml_tensor * rnd = ggml_cuda_bf16_round_fusion_target(cgraph, i);
+                    // or a BF16 round store (BF16 activation storage), written by the same launch
+                    ggml_tensor * store = rnd ? nullptr : ggml_cuda_bf16_store_fusion_target(cgraph, i);
+                    rnd = rnd ? rnd : store;
                     ggml_cuda_op_bin_bf16_round_inputs(*cuda_ctx, node, rnd ? rnd : node,
-                                                       deferred_rounds[i] & 2, deferred_rounds[i] & 4, rnd != nullptr);
+                                                       deferred_rounds[i] & 2, deferred_rounds[i] & 4, rnd != nullptr && !store);
                     i += rnd ? 1 : 0;
                     continue;
                 }
@@ -6049,13 +6149,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_BF16_ROUND:
-                    return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+                    // F32 -> F32 (in place or not); F32 -> BF16 rounding store
+                    // (never in place: different type); BF16 -> BF16 is a pass-through.
+                    return ggml_is_contiguous(op->src[0]) &&
+                        ((op->src[0]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16)) ||
+                         (op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_BF16 &&
+                          (op->src[0]->data == op->data || ggml_is_contiguous(op))));
+                case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_SILU:
+                    // BF16 storage: a BF16 source widens to an F32 result.
+                    if (op->src[0]->type == GGML_TYPE_BF16) {
+                        return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+                    }
+                    return ggml_is_contiguous(op->src[0]);
                 case GGML_UNARY_OP_ABS:
                 case GGML_UNARY_OP_SGN:
-                case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_GELU:
-                case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_HARDSIGMOID:
@@ -6161,8 +6271,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_OUT_PROD:
             // HOT-Step patch: BF16 out_prod — see engine/patches/bf16-out-prod.patch
-            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16);
+            return op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -6221,7 +6332,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const ggml_type t = op->type;
                 return (t == GGML_TYPE_F32 || t == GGML_TYPE_I32) &&
                     t == op->src[0]->type &&
-                    t == op->src[1]->type;
+                    (t == op->src[1]->type || (t == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_BF16));
             }
         case GGML_OP_CPY:
             {
@@ -6296,9 +6407,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_REPEAT:
             {
-                // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
+                // the CUDA REPEAT path only implements F32/F16, plus BF16 -> F32; other types assert at runtime
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
+                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 ||
+                    (src0_type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32);
             }
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
@@ -6355,12 +6467,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     ggml_is_contiguous(op);
             }
         case GGML_OP_SILU_BACK:
+            if (op->type == GGML_TYPE_F32 && (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16)) {
+                return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16);
+            }
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
-        case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
-        case GGML_OP_L2_NORM:
+            if (op->src[0]->type == GGML_TYPE_BF16) {
+                return op->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]);
+            }
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_NORM:
+        case GGML_OP_L2_NORM:
+            return ggml_is_contiguous_rows(op->src[0]) && op->src[0]->type != GGML_TYPE_BF16;
         case GGML_OP_RMS_NORM_BACK:
+            if (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16) {
+                return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16);
+            }
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
@@ -6376,13 +6502,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LOG:
             return true;
         case GGML_OP_SCALE:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type &&
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                   (op->type == op->src[0]->type || op->type == GGML_TYPE_F32) &&
                    ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_CLAMP:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
+            // BF16 storage: either source may be BF16, widened to an F32 result, and any
+            // F32/BF16 mix may store a BF16 result (upstream's BF16 -> BF16 among them).
+            if (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16) {
+                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16);
+            }
+            [[fallthrough]];
         case GGML_OP_DIV:
             if (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_BF16) {
                 return op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_BF16 &&
@@ -6459,6 +6594,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
+            if (op->src[0]->type == GGML_TYPE_BF16 || op->src[1]->type == GGML_TYPE_BF16) {
+                return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16);
+            }
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
             return ggml_is_contiguously_allocated(op->src[0]);

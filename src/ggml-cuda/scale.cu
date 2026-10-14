@@ -4,8 +4,8 @@
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
 // src and dst may be views: rows are contiguous, dims 1..3 follow the strides (in elements).
-template <typename T>
-static __global__ void scale_f32(const T * x, T * dst, const float scale, const float bias, const uint32_t k,
+template <typename T, typename D = T>
+static __global__ void scale_f32(const T * x, D * dst, const float scale, const float bias, const uint32_t k,
                                  const uint3 ne0, const uint3 ne1, const uint3 ne2,
                                  const uint32_t s01, const uint32_t s02, const uint32_t s03,
                                  const uint32_t s1,  const uint32_t s2,  const uint32_t s3) {
@@ -24,13 +24,14 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
     const size_t i_src = d0.y + size_t(d1.y)*s01 + size_t(d2.y)*s02 + size_t(d2.x)*s03;
     const size_t i_dst = d0.y + size_t(d1.y)*s1  + size_t(d2.y)*s2  + size_t(d2.x)*s3;
 
-    dst[i_dst] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i_src]) + bias);
+    dst[i_dst] = ggml_cuda_cast<D>(scale * ggml_cuda_cast<float>(x[i_src]) + bias);
 }
 
-template <typename T>
-static void scale_f32_cuda(const T * x, T * dst, const float scale, const float bias, const ggml_tensor * src0, const ggml_tensor * t, cudaStream_t stream) {
+template <typename T, typename D = T>
+static void scale_f32_cuda(const T * x, D * dst, const float scale, const float bias, const ggml_tensor * src0, const ggml_tensor * t, cudaStream_t stream) {
     const int64_t k  = ggml_nelements(src0);
     const size_t  ts = sizeof(T);
+    const size_t  td = sizeof(D);
     GGML_ASSERT(k <= std::numeric_limits<uint32_t>::max());
 
     const uint3 ne0 = init_fastdiv_values(src0->ne[0]);
@@ -39,9 +40,9 @@ static void scale_f32_cuda(const T * x, T * dst, const float scale, const float 
 
     const int64_t num_blocks = (k + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(scale_f32<T>, launch_params, x, dst, scale, bias, (uint32_t) k, ne0, ne1, ne2,
+    ggml_cuda_kernel_launch(scale_f32<T, D>, launch_params, x, dst, scale, bias, (uint32_t) k, ne0, ne1, ne2,
         src0->nb[1]/ts, src0->nb[2]/ts, src0->nb[3]/ts,
-        t->nb[1]/ts,    t->nb[2]/ts,    t->nb[3]/ts);
+        t->nb[1]/td,    t->nb[2]/td,    t->nb[3]/td);
 }
 
 void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -49,7 +50,8 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
-    GGML_ASSERT(dst->type == src0->type);
+    // a BF16 source may have an F32 result (the YuE2 trainer's BF16 activation storage)
+    GGML_ASSERT(dst->type == src0->type || dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst));
 
     float scale;
@@ -57,7 +59,9 @@ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
 
-    if (src0->type == GGML_TYPE_BF16) {
+    if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+        scale_f32_cuda((const nv_bfloat16 *) src0->data, (float *) dst->data, scale, bias, src0, dst, stream);
+    } else if (src0->type == GGML_TYPE_BF16) {
         scale_f32_cuda((const nv_bfloat16 *) src0->data, (nv_bfloat16 *) dst->data, scale, bias, src0, dst, stream);
     } else {
         scale_f32_cuda((const float *) src0->data, (float *) dst->data, scale, bias, src0, dst, stream);
