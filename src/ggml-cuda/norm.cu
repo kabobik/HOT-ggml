@@ -82,9 +82,9 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T = float>
+template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, typename T = float, typename D = float>
 static __global__ void rms_norm_f32(const T *     x,
-                                    float *       dst,
+                                    D *           dst,
                                     const int     ncols,
                                     const int     nchannels,
                                     const int     nsamples,
@@ -125,7 +125,7 @@ static __global__ void rms_norm_f32(const T *     x,
     for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
         for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
             const T     * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
-            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+            D           * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
 
             [[maybe_unused]] const float * mulc = nullptr;
             if constexpr (do_multiply) {
@@ -148,7 +148,7 @@ static __global__ void rms_norm_f32(const T *     x,
                 [[maybe_unused]] const float4 * x4 = (const float4 *) xc;
                 const float4 * mul4   = (const float4 *) mulc;
                 const float4 * add4   = (const float4 *) addc;
-                float4 *       dst4   = (float4 *) dstc;
+                [[maybe_unused]] float4 * dst4 = (float4 *) dstc;
 
                 float4 xs[vpt];
                 float  tmp = 0.0f;
@@ -194,7 +194,14 @@ static __global__ void rms_norm_f32(const T *     x,
                             r.z *= scale_out;
                             r.w *= scale_out;
                         }
-                        dst4[i] = r;
+                        if constexpr (std::is_same_v<D, float>) {
+                            dst4[i] = r;
+                        } else {
+                            dstc[4*i + 0] = ggml_cuda_cast<D>(r.x);
+                            dstc[4*i + 1] = ggml_cuda_cast<D>(r.y);
+                            dstc[4*i + 2] = ggml_cuda_cast<D>(r.z);
+                            dstc[4*i + 3] = ggml_cuda_cast<D>(r.w);
+                        }
                     }
                 }
             } else {
@@ -215,14 +222,14 @@ static __global__ void rms_norm_f32(const T *     x,
                     if constexpr (do_multiply && do_add) {
                         const int mul_col = fastmodulo(col, mul_ncols_packed);
                         const int add_col = fastmodulo(col, add_ncols_packed);
-                        dstc[col]         = scale * ggml_cuda_cast<float>(xc[col]) * mulc[mul_col] + addc[add_col];
+                        dstc[col]         = ggml_cuda_cast<D>(scale * ggml_cuda_cast<float>(xc[col]) * mulc[mul_col] + addc[add_col]);
                     } else if constexpr (do_multiply) {
                         const int mul_col = fastmodulo(col, mul_ncols_packed);
-                        dstc[col]         = scale * ggml_cuda_cast<float>(xc[col]) * mulc[mul_col];
+                        dstc[col]         = ggml_cuda_cast<D>(scale * ggml_cuda_cast<float>(xc[col]) * mulc[mul_col]);
                     } else if constexpr (do_scale) {
-                        dstc[col] = scale_out * (scale * ggml_cuda_cast<float>(xc[col]));
+                        dstc[col] = ggml_cuda_cast<D>(scale_out * (scale * ggml_cuda_cast<float>(xc[col])));
                     } else {
-                        dstc[col] = scale * ggml_cuda_cast<float>(xc[col]);
+                        dstc[col] = ggml_cuda_cast<D>(scale * ggml_cuda_cast<float>(xc[col]));
                     }
                 }
             }
@@ -235,9 +242,9 @@ static __global__ void rms_norm_f32(const T *     x,
     }
 }
 
-template <int block_size, typename T_grad, typename T_x>
+template <int block_size, typename T_grad, typename T_x, typename D = float>
 static __global__ void rms_norm_back_f32(
-        const T_grad * grad, const T_x * xf, float * dst, const int ncols, const float eps) {
+        const T_grad * grad, const T_x * xf, D * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
@@ -284,7 +291,7 @@ static __global__ void rms_norm_back_f32(
     const float scale_x    = -scale_grad * sum_xg/sum_eps;
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale_grad*ggml_cuda_cast<float>(grad[col]) + scale_x*ggml_cuda_cast<float>(xf[col]);
+        dst[col] = ggml_cuda_cast<D>(scale_grad*ggml_cuda_cast<float>(grad[col]) + scale_x*ggml_cuda_cast<float>(xf[col]));
     }
 }
 
@@ -393,7 +400,7 @@ static void group_norm_f32_cuda(
     do { \
         const dim3 block_dims(BLOCK_SIZE, 1, 1); \
         const ggml_cuda_kernel_launch_params launch_params{ blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream }; \
-        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_X>, launch_params, \
+        ggml_cuda_kernel_launch(rms_norm_f32<BLOCK_SIZE, VPT, VEC, do_multiply, do_add, do_scale, T_X, D_X>, launch_params, \
             x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, \
             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
@@ -401,10 +408,10 @@ static void group_norm_f32_cuda(
             add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out); \
     } while (0)
 
-template <bool do_multiply, bool do_add, bool do_scale, typename T_X = float>
+template <bool do_multiply, bool do_add, bool do_scale, typename T_X = float, typename D_X = float>
 static void rms_norm_f32_dispatch(
         const dim3     blocks_num,
-        const ggml_tensor * x_t,   float * dst,   const int ncols, const int nchannels, const int nsamples,
+        const ggml_tensor * x_t,   D_X * dst,   const int ncols, const int nchannels, const int nsamples,
         const int64_t  stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
         const ggml_tensor * mul_t, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const uint3    mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
@@ -420,7 +427,7 @@ static void rms_norm_f32_dispatch(
     const T_X * x = (const T_X *) x_t->data;
 
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
-    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst & 15) == 0;
+    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst % (4*sizeof(D_X))) == 0;
     // 4 elements: a BF16 source takes the path an F32 source of the same layout takes
     vec = vec && ggml_cuda_is_aligned(x_t, 4*sizeof(T_X));
     if constexpr (do_multiply) {
@@ -457,9 +464,9 @@ static void rms_norm_f32_dispatch(
 }
 #undef RMS_NORM_LAUNCH
 
-template <bool do_scale = false>
+template <bool do_scale = false, typename D_X = float>
 static void rms_norm_f32_cuda(
-        const ggml_tensor * x_t, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const ggml_tensor * x_t, D_X * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
         const float scale_out = 1.0f) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
@@ -467,14 +474,14 @@ static void rms_norm_f32_cuda(
         // A BF16 source (the YuE2 trainer's BF16 activation storage): each load widens
         // exactly and the kernel and block shape are the F32 source's, so the result
         // is the F32 path's bit for bit.
-        rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale, nv_bfloat16>(
+        rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale, nv_bfloat16, D_X>(
             blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
             nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
             nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
             stream, scale_out);
         return;
     }
-    rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale>(
+    rms_norm_f32_dispatch</*do_multiply*/false, /*do_add*/false, do_scale, float, D_X>(
         blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
@@ -539,14 +546,14 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
     }
 }
 
-template <typename T_grad, typename T_x>
-static void rms_norm_back_f32_cuda(const T_grad * grad, const T_x * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+template <typename T_grad, typename T_x, typename D>
+static void rms_norm_back_f32_cuda(const T_grad * grad, const T_x * xf, D * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        rms_norm_back_f32<WARP_SIZE, T_grad, T_x><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<WARP_SIZE, T_grad, T_x, D><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        rms_norm_back_f32<1024, T_grad, T_x><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<1024, T_grad, T_x, D><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
     }
 }
 
@@ -610,11 +617,11 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    float * dst_d = (float *) dst->data;
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    // BF16: a fused BF16 round store (ggml_cuda_bf16_producer_store_target)
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
 
     GGML_TENSOR_UNARY_OP_LOCALS;
 
@@ -628,7 +635,11 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    rms_norm_f32_cuda(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    if (dst->type == GGML_TYPE_BF16) {
+        rms_norm_f32_cuda(src0, (nv_bfloat16 *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    } else {
+        rms_norm_f32_cuda(src0, (float *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    }
 }
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
@@ -798,15 +809,14 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * grad  = dst->src[0]; // gradients
     const ggml_tensor * src0f = dst->src[1]; // src0 from forward pass
 
-    float * dst_d = (float *) dst->data;
-
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(ggml_is_contiguous(grad));
 
     GGML_ASSERT( grad->type == GGML_TYPE_F32 ||  grad->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0f->type == GGML_TYPE_F32 || src0f->type == GGML_TYPE_BF16);
-    GGML_ASSERT(  dst->type == GGML_TYPE_F32);
+    // BF16: a fused BF16 round store (ggml_cuda_bf16_producer_store_target)
+    GGML_ASSERT(  dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_BF16);
 
     const int64_t ne00 = src0f->ne[0];
     const int64_t nrows = ggml_nrows(src0f);
@@ -817,14 +827,21 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     const bool grad_bf16 =  grad->type == GGML_TYPE_BF16;
     const bool x_bf16    = src0f->type == GGML_TYPE_BF16;
-    if (grad_bf16 && x_bf16) {
-        rms_norm_back_f32_cuda((const nv_bfloat16 *) grad->data, (const nv_bfloat16 *) src0f->data, dst_d, ne00, nrows, eps, stream);
-    } else if (grad_bf16) {
-        rms_norm_back_f32_cuda((const nv_bfloat16 *) grad->data, (const float       *) src0f->data, dst_d, ne00, nrows, eps, stream);
-    } else if (x_bf16) {
-        rms_norm_back_f32_cuda((const float       *) grad->data, (const nv_bfloat16 *) src0f->data, dst_d, ne00, nrows, eps, stream);
+    auto launch = [&](auto * dst_d) {
+        if (grad_bf16 && x_bf16) {
+            rms_norm_back_f32_cuda((const nv_bfloat16 *) grad->data, (const nv_bfloat16 *) src0f->data, dst_d, ne00, nrows, eps, stream);
+        } else if (grad_bf16) {
+            rms_norm_back_f32_cuda((const nv_bfloat16 *) grad->data, (const float       *) src0f->data, dst_d, ne00, nrows, eps, stream);
+        } else if (x_bf16) {
+            rms_norm_back_f32_cuda((const float       *) grad->data, (const nv_bfloat16 *) src0f->data, dst_d, ne00, nrows, eps, stream);
+        } else {
+            rms_norm_back_f32_cuda((const float       *) grad->data, (const float       *) src0f->data, dst_d, ne00, nrows, eps, stream);
+        }
+    };
+    if (dst->type == GGML_TYPE_BF16) {
+        launch((nv_bfloat16 *) dst->data);
     } else {
-        rms_norm_back_f32_cuda((const float       *) grad->data, (const float       *) src0f->data, dst_d, ne00, nrows, eps, stream);
+        launch((float *) dst->data);
     }
 }
 
