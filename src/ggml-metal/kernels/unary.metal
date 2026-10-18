@@ -2,6 +2,9 @@
 
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
+// HOT-Step: SILU stores bf16_round_cast(result), absorbing a following single-consumer
+// BF16_ROUND (checked host-side in ggml_metal_op_unary)
+constant bool  FC_unary_rnd[[function_constant(FC_UNARY + 2)]];
 
 template <typename T, typename U>
 inline constexpr T ggml_metal_unary_cast(U x) {
@@ -130,7 +133,8 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SILU) {
-            dst_ptr[i0] = ggml_metal_unary_cast<T>(x / (1 + exp(-x)));
+            const TC y = x / (1 + exp(-x));
+            dst_ptr[i0] = ggml_metal_unary_cast<T>(FC_unary_rnd ? bf16_round_cast<TC>(y) : y);
         }
 
         if (FC_OP == OP_UNARY_NUM_ELU) {
