@@ -1922,10 +1922,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             compute_type = GGML_TYPE_F32;
         }
     }
+    const bool strict_f32 = ggml_get_op_params_i32(dst, 1) == GGML_HINT_STRICT_F32;
     // F16 is the only compute type that can not satisfy a request for BF16
-    if (prec == GGML_PREC_BF16 && compute_type == GGML_TYPE_F16) {
+    if (prec == GGML_PREC_BF16 && compute_type == GGML_TYPE_F16 && !strict_f32) {
         compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-    } else if (prec == GGML_PREC_F32) {
+    } else if (prec == GGML_PREC_F32 || strict_f32) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -1959,6 +1960,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             ggml_tensor src0_chunk = *src0;
             ggml_tensor dst_chunk = *dst;
 
+            // a strict GEMM runs the chunks in the default math mode too, see below
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+            }
             for (int64_t i01 = 0; i01 < src0->ne[1]; i01 += rows_per_chunk) {
                 src0_chunk.ne[1] = std::min(rows_per_chunk, src0->ne[1] - i01);
                 src0_chunk.data = (char *) src0->data + i01*src0->nb[1];
@@ -1968,13 +1973,24 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
 
                 ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, &src0_chunk, src1, &dst_chunk);
             }
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+            }
             return;
         }
     }
 
     switch (compute_type) {
         case GGML_TYPE_F32:
+            // The handle runs CUBLAS_TF32_TENSOR_OP_MATH (common.cuh); a strict GEMM takes
+            // the default math mode, which keeps CUBLAS_COMPUTE_32F and Sgemm off TF32.
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+            }
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+            }
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
@@ -2263,7 +2279,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // HOT-Step patch: strict-f32-hint. GGML_HINT_STRICT_F32 skips the custom kernels
+    // (mmf runs F32 on TF32 mma) for cuBLAS, which drops TF32 for it below.
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_STRICT_F32 || bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
