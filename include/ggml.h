@@ -454,6 +454,9 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // HOT-Step: full FP32 arithmetic for this MUL_MAT. ggml-cuda otherwise runs
+        // F32 GEMMs on TF32 tensor cores (cuBLAS math mode, mmf); other backends ignore it.
+        GGML_HINT_STRICT_F32       = 100,
     };
 
     // model file types

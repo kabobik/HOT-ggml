@@ -1674,7 +1674,8 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             compute_type = GGML_TYPE_F32;
         }
     }
-    if (dst->op_params[0] == GGML_PREC_F32) {
+    const bool strict_f32 = ggml_get_op_params_i32(dst, 1) == GGML_HINT_STRICT_F32;
+    if (dst->op_params[0] == GGML_PREC_F32 || strict_f32) {
         compute_type = GGML_TYPE_F32;
     }
 
@@ -1697,7 +1698,15 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
 
     switch (compute_type) {
         case GGML_TYPE_F32:
+            // The handle runs CUBLAS_TF32_TENSOR_OP_MATH (common.cuh); a strict GEMM takes
+            // the default math mode, which keeps CUBLAS_COMPUTE_32F and Sgemm off TF32.
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+            }
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst);
+            if (strict_f32) {
+                CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
+            }
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst);
@@ -1873,7 +1882,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    // HOT-Step patch: strict-f32-hint. GGML_HINT_STRICT_F32 skips the custom kernels
+    // (mmf runs F32 on TF32 mma) for cuBLAS, which drops TF32 for it below.
+    if (hint == GGML_HINT_STRICT_F32 || bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
