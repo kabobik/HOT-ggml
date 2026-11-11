@@ -1670,7 +1670,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const int64_t ldc = nb1 / sizeof(float);
+    // In elements of dst's own type: the BF16 GEMM store writes a BF16 dst,
+    // where nb1 / sizeof(float) is half the row and cuBLAS rejects ldc < m.
+    const int64_t ldc = nb1 / ggml_type_size(dst->type);
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     cublasHandle_t cublas_h = ctx.cublas_handle();
