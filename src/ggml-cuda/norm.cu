@@ -426,8 +426,15 @@ static void rms_norm_f32_dispatch(
 
     const T_X * x = (const T_X *) x_t->data;
 
+    // HOT-Step patch: rms-norm-scalar - the float4 kernels sum each row in a
+    // different order from the scalar ones. On the MM3 LM trainer that order change
+    // alone moved the step-2 gradient norm from 49.83 to 35.86 (early layers carry
+    // hidden norms of 1e4 to 4e5, and the backward amplifies the difference); with
+    // the scalar selection, training is bit-identical to the pre-0.29 fork. Scalar is
+    // the default; GGML_CUDA_RMS_NORM_VEC=1 opts into the vector kernels.
+    static const bool rms_vec = getenv("GGML_CUDA_RMS_NORM_VEC") != nullptr;
     // dst is written at row * ncols, i.e. always at a multiple of ncols, so only its base needs checking here
-    bool vec = ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst % (4*sizeof(D_X))) == 0;
+    bool vec = rms_vec && ncols % 4 == 0 && ncols > 0 && ((uintptr_t) dst % (4*sizeof(D_X))) == 0;
     // 4 elements: a BF16 source takes the path an F32 source of the same layout takes
     vec = vec && ggml_cuda_is_aligned(x_t, 4*sizeof(T_X));
     if constexpr (do_multiply) {
