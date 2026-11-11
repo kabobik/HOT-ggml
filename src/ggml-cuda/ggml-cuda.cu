@@ -2289,7 +2289,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+    // HOT-Step patch: few-rows-mmvf. An F16 matrix with few rows and a small batch, e.g. a
+    // LoRA down-projection A (rank rows, a long K) at decode, gets rows/32 blocks from mmf:
+    // 8 for rank 256, far below the SM count. When the node asks for F32 precision, mmvf
+    // gives every row its own block and accumulates in F32 (at default precision it would
+    // accumulate in half on fast-FP16 GPUs, so it stays opt-in per node).
+    const bool few_rows_mmvf = src0->type == GGML_TYPE_F16 && ggml_prec(dst->op_params[0]) == GGML_PREC_F32 &&
+        ne01 <= 512 && ne11 >= 2 && ne11 <= MMVF_MAX_BATCH_SIZE && ne02*ne03 == 1 && ne12*ne13 == 1 &&
+        ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, /*ne11 =*/ 1);
+    if (few_rows_mmvf || ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
