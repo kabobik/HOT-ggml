@@ -825,6 +825,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // A matrix with few rows and a small batch, e.g. a LoRA down-projection
+                // A (rank rows, a long K) at decode: mmf tiles 32 rows per block, so a
+                // rank-256 A runs on 8 blocks, far below the SM count; mmvf gives each
+                // row its own block.
+                if (src0_ne[1] <= 512 && src0_ne[2]*src0_ne[3] == 1 && ne11 <= MMVF_MAX_BATCH_SIZE) {
+                    return true;
+                }
                 // MMF needs full row tiles, for other row counts MMVF still beats cuBLAS at small batch size
                 if (src0_small && !ggml_cuda_should_use_mmf(type, cc, warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false)) {
                     return ne11 <= MMVF_MAX_BATCH_SIZE;
