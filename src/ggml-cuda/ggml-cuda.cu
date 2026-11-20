@@ -734,7 +734,10 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
                                                                                int                         device,
                                                                                [[maybe_unused]] int        stream_no) {
 #if defined(GGML_USE_VMM)
-    if (ggml_cuda_info().devices[device].vmm) {
+    // Bobik: VMM allocations cannot spill to host RAM. The legacy pool
+    // uses ggml_cuda_device_malloc, which honors unified memory for scratch
+    // buffers as well as persistent graph/weight buffers. Opt-in only.
+    if (ggml_cuda_info().devices[device].vmm && !ggml_cuda_unified_memory_enabled()) {
         return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
     }
 #endif // defined(GGML_USE_VMM)
