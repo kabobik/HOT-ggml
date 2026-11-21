@@ -160,9 +160,19 @@ static bool ggml_cuda_env_set(const char * name) {
     return getenv(name) != nullptr;
 }
 
+// Tensor-parallel shards must stay local to their owner. Leave other requests,
+// including the serial retry on this same thread, on the configured allocator.
+static thread_local bool ggml_cuda_device_memory_only = false;
+
+static bool ggml_cuda_set_device_memory_only(bool value) {
+    const bool previous = ggml_cuda_device_memory_only;
+    ggml_cuda_device_memory_only = value;
+    return previous;
+}
+
 static bool ggml_cuda_unified_memory_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
-    return enabled;
+    return enabled && !ggml_cuda_device_memory_only;
 }
 
 static bool ggml_cuda_pinned_memory_disabled() {
@@ -7003,6 +7013,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_cuda_set_device_memory_only") == 0) {
+        return (void *)ggml_cuda_set_device_memory_only;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

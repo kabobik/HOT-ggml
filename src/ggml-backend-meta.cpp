@@ -624,8 +624,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[0].axis < GGML_MAX_DIMS) {
-            GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
-            return src_ss[0];
+            const int axis = src_ss[0].axis;
+            const int64_t left = tensor->src[0]->ne[axis], right = tensor->src[1]->ne[axis];
+            if (right == left) {
+                GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+                return src_ss[0];
+            } else {
+                // Grouped-query attention broadcasts each KV head to a contiguous
+                // group of query heads. That whole group must stay on one device.
+                GGML_ASSERT(left > 0 && right % left == 0);
+                GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[1].n_segments == 1);
+                for (size_t j = 0; j < n_bufs; ++j) {
+                    GGML_ASSERT(src_ss[0].ne[j] * src_ss[0].nr[0] * (right / left) ==
+                                src_ss[1].ne[j] * src_ss[1].nr[0]);
+                }
+            }
+            return src_ss[1];
         }
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -1026,6 +1040,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_SOFT_MAX:
+                // A single shared mask row per query is broadcast across heads.
+                if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 && tensor->src[1] &&
+                        src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                        tensor->src[1]->ne[2] == 1 && !tensor->src[2] &&
+                        ggml_get_op_params_f32(tensor, 1) == 0.0f) {
+                    split_state = src_ss[0];
+                    break;
+                }
+                // fall through
             case GGML_OP_SOFT_MAX_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -1801,7 +1824,10 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
-        GGML_ASSERT(bufs.back() != nullptr);
+        if (!bufs.back()) {
+            for (auto buf : bufs) ggml_backend_buffer_free(buf);
+            return nullptr;
+        }
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -1858,7 +1884,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
+        if (!meta_buf_ctx->bufs[i]) {
+            for (int t = 0; t < n_tensors; ++t) {
+                tensors[t]->buffer = nullptr;
+                tensors[t]->data = nullptr;
+            }
+            ggml_backend_buffer_free(meta_buf);
+            return nullptr;
+        }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;
@@ -2334,6 +2367,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto & bcj = backend_ctx->backend_configs[j];
                 for (size_t i = 0; i < backend_ctx->n_reduce_steps; i++) {
                     bcj.bufs[i].reset(ggml_backend_alloc_buffer(bcj.backend, max_tmp_size));
+                    if (!bcj.bufs[i]) {
+                        backend_ctx->uid = 0;
+                        return GGML_STATUS_ALLOC_FAILED;
+                    }
                 }
             }
             backend_ctx->max_tmp_size = max_tmp_size;
